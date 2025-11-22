@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2025-11-19 10:13:44 by Eclipse SUMO GUI Version 1.24.0
+<sumoConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
+
+    <input>
+        <net-file value="c:\Users\Yiping\Downloads\Traci\Traci.net.xml"/>
+        <route-files value="c:\Users\Yiping\Downloads\Traci\Traci.rou.xml"/>
+        <additional-files value="c:\Users\Yiping\Downloads\Traci\Traci.add.xml"/>
+    </input>
+
+    <time>
+        <step-length value="0.10"/>
+    </time>
+
+    <processing>
+        <lateral-resolution value="0"/>
+    </processing>
+
+    <traci_server>
+        <remote-port value="54011"/>
+    </traci_server>
+
+    <gui_only>
+        <delay value="0"/>
+    </gui_only>
+
+</sumoConfiguration>
+-->
+
+<detector xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/det_e2_file.xsd">
+   <interval begin="0.00" end="196.80" id="Node2_4_SB_2" sampledSeconds="660.67" nVehEntered="17" nVehLeft="10" nVehSeen="17" meanSpeed="2.48" meanTimeLoss="31.96" meanOccupancy="10.32" maxOccupancy="23.16" meanMaxJamLengthInVehicles="2.27" meanMaxJamLengthInMeters="14.44" maxJamLengthInVehicles="6" maxJamLengthInMeters="47.33" jamLengthInVehiclesSum="4491" jamLengthInMetersSum="28483.32" meanHaltingDuration="18.48" maxHaltingDuration="55.00" haltingDurationSum="443.60" meanIntervalHaltingDuration="18.48" maxIntervalHaltingDuration="55.00" intervalHaltingDurationSum="443.60" startedHalts="28.00" meanVehicleNumber="3.36" maxVehicleNumber="7" />
+</detector>
