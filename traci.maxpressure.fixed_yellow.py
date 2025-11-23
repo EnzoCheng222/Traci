@@ -67,6 +67,9 @@ TOTAL_STEPS = int(SIM_TIME / STEP_LENGTH)
 MIN_GREEN_STEPS = 100
 last_switch_step = -MIN_GREEN_STEPS
 
+# 黃燈時間設定
+YELLOW_DURATION_STEPS = 30  # 3 seconds
+
 # Max-Pressure 用到的 phase 群組（下面會自動偵測）
 EB_PHASES = []  # 東西向直行相關 phase index
 SB_PHASES = []  # 南北向直行相關 phase index
@@ -88,6 +91,10 @@ total_arrived_vehicles = 0
 total_steps = 0
 
 cumulative_reward = 0.0
+
+# 黃燈控制變數
+in_yellow_phase = False
+yellow_start_step = -1
 
 
 # -------------------------
@@ -217,20 +224,39 @@ def get_reward(q_EB, q_SB):
 
 def max_pressure_control(q_EB, q_SB, curr_phase, step):
     """
-    改進版 Max-Pressure (加入切換閾值)：
-    - 只有當壓力差 >= 15 輛車時才切換
+    改進版 Max-Pressure：
+    - 加入完整的黃燈過渡機制
     - q_EB > q_SB → 優先 EB 綠燈（若目前不是 EB 相位則切換）
     - q_SB > q_EB → 優先 SB 綠燈
     - 持續遵守 MIN_GREEN_STEPS
+    - 切換時先進入黃燈相位,等待 YELLOW_DURATION_STEPS 後才切換到目標綠燈相位
     """
-    global last_switch_step
+    global last_switch_step, in_yellow_phase, yellow_start_step
 
+    # 如果正在黃燈階段
+    if in_yellow_phase:
+        # 檢查黃燈時間是否已經結束
+        if step - yellow_start_step >= YELLOW_DURATION_STEPS:
+            # 黃燈結束,切換到下一個綠燈相位
+            program = traci.trafficlight.getAllProgramLogics(TLS_ID)[0]
+            num_phases = len(program.phases)
+            next_phase = (curr_phase + 1) % num_phases
+            
+            traci.trafficlight.setPhase(TLS_ID, next_phase)
+            traci.trafficlight.setPhaseDuration(TLS_ID, 99999)
+            
+            in_yellow_phase = False
+            last_switch_step = step
+            print(f"Step {step}: Yellow -> Green (Phase {next_phase})")
+        return
+
+    # 綠燈階段：Max-Pressure 決策
     target_phase = curr_phase
     SWITCH_THRESHOLD = 15  # 壓力差閾值：15 輛車
-
+    
     # 計算壓力差
     pressure_diff = abs(q_EB - q_SB)
-    
+
     # Max-Pressure 決策 (加入閾值判斷)
     if pressure_diff >= SWITCH_THRESHOLD:
         if q_EB > q_SB:
@@ -244,19 +270,40 @@ def max_pressure_control(q_EB, q_SB, curr_phase, step):
     # min-green 限制
     if (step - last_switch_step) >= MIN_GREEN_STEPS:
         if target_phase != curr_phase:
-            print(f"Step {step}: phase {curr_phase} → {target_phase} (qEB={q_EB}, qSB={q_SB}, diff={pressure_diff})")
-            traci.trafficlight.setPhase(TLS_ID, target_phase)
-            last_switch_step = step
+            # 需要切換相位,先進入黃燈
+            program = traci.trafficlight.getAllProgramLogics(TLS_ID)[0]
+            num_phases = len(program.phases)
+            next_phase = (curr_phase + 1) % num_phases
+            
+            traci.trafficlight.setPhase(TLS_ID, next_phase)
+            traci.trafficlight.setPhaseDuration(TLS_ID, 99999)
+            
+            in_yellow_phase = True
+            yellow_start_step = step
+            print(f"Step {step}: Green -> Yellow (Phase {next_phase}, qEB={q_EB}, qSB={q_SB}, diff={pressure_diff})")
 
 
 # -------------------------
-# Step 8: Max-Pressure Control Loop
+# Step 8: 初始化：搶回號誌控制權
 # -------------------------
+
+# 不管 net.xml 裡面是 static / actuated，一律改成由我們控制 phase duration
+try:
+    current_program = traci.trafficlight.getProgram(TLS_ID)
+except Exception:
+    current_program = "0"
+
+traci.trafficlight.setProgram(TLS_ID, current_program)
+traci.trafficlight.setPhaseDuration(TLS_ID, 99999)
 
 # 先根據目前 Node2 的號誌設定，自動偵測 EB / SB phase
 build_approach_signal_indices()
 
-print("\n=== Starting Max-Pressure Control Simulation (1800 sec) ===")
+# -------------------------
+# Step 9: Max-Pressure Control Loop
+# -------------------------
+
+print("\n=== Starting Max-Pressure Control with Proper Yellow Phase (1800 sec) ===")
 
 for step in range(TOTAL_STEPS):
     current_simulation_step = step
@@ -290,7 +337,7 @@ for step in range(TOTAL_STEPS):
     if phase in SB_PHASES:
         sb_green_steps += 1
 
-    # 控制（Max-Pressure）
+    # 控制（Max-Pressure with Yellow Phase）
     max_pressure_control(q_EB, q_SB, phase, step)
 
     # 推進 SUMO 一步
@@ -306,7 +353,7 @@ for step in range(TOTAL_STEPS):
         print(f"[t={sim_time:4.1f}s] qEB={q_EB:3d}, qSB={q_SB:3d} | hEB={h_EB:3d}, hSB={h_SB:3d} ({status_str}), phase={phase}")
 
 # -------------------------
-# Step 9: Close SUMO
+# Step 10: Close SUMO
 # -------------------------
 traci.close()
 
@@ -367,4 +414,3 @@ print(f"Avg Delay Time      = {avg_delay_time:.2f} sec/veh")
 print(f"Total Waiting Time  = {total_waiting_time:.2f} veh·sec")
 print(f"Cumulative reward   = {cumulative_reward:.2f}")
 print("========================================================================\n")
-

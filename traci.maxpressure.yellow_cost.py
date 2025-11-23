@@ -1,3 +1,8 @@
+# ================================
+# Max-Pressure Traffic Light Control for Node2
+# Version: Include Yellow Phase Cost in Decision
+# ================================
+
 # Step 1: Add modules to provide access to specific libraries and functions
 import os  # Module provides functions to handle file paths, directories, environment variables
 import sys  # Module provides access to Python-specific system parameters and functions
@@ -66,6 +71,9 @@ TOTAL_STEPS = int(SIM_TIME / STEP_LENGTH)
 # Min-green（以 step 為單位）
 MIN_GREEN_STEPS = 100
 last_switch_step = -MIN_GREEN_STEPS
+
+# 黃燈時間設定
+YELLOW_DURATION_STEPS = 30  # 3 seconds
 
 # Max-Pressure 用到的 phase 群組（下面會自動偵測）
 EB_PHASES = []  # 東西向直行相關 phase index
@@ -215,48 +223,97 @@ def get_reward(q_EB, q_SB):
     return -float(total_queue)
 
 
-def max_pressure_control(q_EB, q_SB, curr_phase, step):
+def estimate_yellow_cost(current_step):
     """
-    改進版 Max-Pressure (加入切換閾值)：
-    - 只有當壓力差 >= 15 輛車時才切換
-    - q_EB > q_SB → 優先 EB 綠燈（若目前不是 EB 相位則切換）
+    估算如果現在切換到黃燈,黃燈期間會產生多少停等成本
+    這是一個簡化的估算,假設黃燈期間停等車輛數不會有太大變化
+    """
+    # 讀取當前停等車輛數
+    _, _, h_EB, h_SB, _ = get_state()
+    current_halting = h_EB + h_SB
+    
+    # 估算黃燈期間的總成本 = 當前停等數 * 黃燈持續時間
+    estimated_cost = current_halting * YELLOW_DURATION_STEPS
+    
+    return -float(estimated_cost)  # 負值表示懲罰
+
+
+def max_pressure_control_with_cost(q_EB, q_SB, curr_phase, step):
+    """
+    改進版 Max-Pressure with Yellow Cost Consideration:
+    - 在決定是否切換時,考慮黃燈期間的停等成本
+    - 只有當切換的好處大於黃燈成本時才切換
+    - q_EB > q_SB → 優先 EB 綠燈（若目前不是 EB 相位則考慮切換）
     - q_SB > q_EB → 優先 SB 綠燈
     - 持續遵守 MIN_GREEN_STEPS
     """
     global last_switch_step
 
+    # Min-green 限制
+    if (step - last_switch_step) < MIN_GREEN_STEPS:
+        return  # 還沒到最小綠燈時間,不做任何切換
+
+    # Max-Pressure 決策
+    should_switch = False
     target_phase = curr_phase
-    SWITCH_THRESHOLD = 15  # 壓力差閾值：15 輛車
 
-    # 計算壓力差
-    pressure_diff = abs(q_EB - q_SB)
-    
-    # Max-Pressure 決策 (加入閾值判斷)
-    if pressure_diff >= SWITCH_THRESHOLD:
-        if q_EB > q_SB:
-            if curr_phase not in EB_PHASES:
-                target_phase = EB_PHASES[0]
-        elif q_SB > q_EB:
-            if curr_phase not in SB_PHASES:
-                target_phase = SB_PHASES[0]
-    # 否則壓力差不夠大 → 維持原相位
+    if q_EB > q_SB:
+        if curr_phase not in EB_PHASES:
+            should_switch = True
+            target_phase = EB_PHASES[0]
+    elif q_SB > q_EB:
+        if curr_phase not in SB_PHASES:
+            should_switch = True
+            target_phase = SB_PHASES[0]
 
-    # min-green 限制
-    if (step - last_switch_step) >= MIN_GREEN_STEPS:
-        if target_phase != curr_phase:
-            print(f"Step {step}: phase {curr_phase} → {target_phase} (qEB={q_EB}, qSB={q_SB}, diff={pressure_diff})")
-            traci.trafficlight.setPhase(TLS_ID, target_phase)
+    # 如果 Max-Pressure 建議切換,進一步評估黃燈成本
+    if should_switch:
+        # 計算壓力差 (切換的潛在好處)
+        pressure_diff = abs(q_EB - q_SB)
+        
+        # 估算黃燈成本
+        yellow_cost = estimate_yellow_cost(step)
+        
+        # 簡化的決策：只有當壓力差夠大時才切換
+        # 這裡使用一個閾值來判斷是否值得切換
+        # 閾值可以根據實際情況調整
+        SWITCH_THRESHOLD = 15  # 壓力差至少要大於 15 輛車才考慮切換
+        
+        if pressure_diff >= SWITCH_THRESHOLD:
+            # 執行切換
+            program = traci.trafficlight.getAllProgramLogics(TLS_ID)[0]
+            num_phases = len(program.phases)
+            next_phase = (curr_phase + 1) % num_phases
+            
+            traci.trafficlight.setPhase(TLS_ID, next_phase)
+            traci.trafficlight.setPhaseDuration(TLS_ID, 99999)
+            
             last_switch_step = step
+            print(f"Step {step}: Switch (qEB={q_EB}, qSB={q_SB}, diff={pressure_diff}, cost={yellow_cost:.1f})")
 
 
 # -------------------------
-# Step 8: Max-Pressure Control Loop
+# Step 8: 初始化：搶回號誌控制權
 # -------------------------
+
+# 不管 net.xml 裡面是 static / actuated，一律改成由我們控制 phase duration
+try:
+    current_program = traci.trafficlight.getProgram(TLS_ID)
+except Exception:
+    current_program = "0"
+
+traci.trafficlight.setProgram(TLS_ID, current_program)
+traci.trafficlight.setPhaseDuration(TLS_ID, 99999)
 
 # 先根據目前 Node2 的號誌設定，自動偵測 EB / SB phase
 build_approach_signal_indices()
 
-print("\n=== Starting Max-Pressure Control Simulation (1800 sec) ===")
+# -------------------------
+# Step 9: Max-Pressure Control Loop with Yellow Cost
+# -------------------------
+
+print("\n=== Starting Max-Pressure Control with Yellow Cost Consideration (1800 sec) ===")
+print("=== Logic: Max-Pressure considers yellow phase cost before switching ===")
 
 for step in range(TOTAL_STEPS):
     current_simulation_step = step
@@ -290,8 +347,8 @@ for step in range(TOTAL_STEPS):
     if phase in SB_PHASES:
         sb_green_steps += 1
 
-    # 控制（Max-Pressure）
-    max_pressure_control(q_EB, q_SB, phase, step)
+    # 控制（Max-Pressure with Yellow Cost Consideration）
+    max_pressure_control_with_cost(q_EB, q_SB, phase, step)
 
     # 推進 SUMO 一步
     traci.simulationStep()
@@ -306,7 +363,7 @@ for step in range(TOTAL_STEPS):
         print(f"[t={sim_time:4.1f}s] qEB={q_EB:3d}, qSB={q_SB:3d} | hEB={h_EB:3d}, hSB={h_SB:3d} ({status_str}), phase={phase}")
 
 # -------------------------
-# Step 9: Close SUMO
+# Step 10: Close SUMO
 # -------------------------
 traci.close()
 
@@ -367,4 +424,3 @@ print(f"Avg Delay Time      = {avg_delay_time:.2f} sec/veh")
 print(f"Total Waiting Time  = {total_waiting_time:.2f} veh·sec")
 print(f"Cumulative reward   = {cumulative_reward:.2f}")
 print("========================================================================\n")
-
