@@ -7,7 +7,7 @@ import os
 import sys
 import json
 import time
-from openai import OpenAI
+import google.generativeai as genai
 
 # 取得程式所在資料夾
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,28 +36,34 @@ Sumo_config = [
 ]
 
 # ================================================
-# LLM Configuration
+# Google Gemini Configuration
 # ================================================
 
-# ⚠️ IMPORTANT: Set your OpenAI API key
+# ⚠️ IMPORTANT: Set your Google Gemini API key
+# Get your free API key from: https://makersuite.google.com/app/apikey
 # Option 1: Environment variable (recommended)
 # Option 2: Hardcode here (not recommended for production)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-api-key-here")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDqT-0MfSvqSYCqw4RrRKE5j9GIHCGvLG0")
 
-if OPENAI_API_KEY == "your-api-key-here":
-    print("⚠️  WARNING: Please set your OpenAI API key!")
-    print("   Option 1: Set environment variable OPENAI_API_KEY")
-    print("   Option 2: Edit the script and replace 'your-api-key-here'")
+if GEMINI_API_KEY == "your-gemini-api-key-here":
+    print("⚠️  WARNING: Please set your Google Gemini API key!")
+    print("   Step 1: Go to https://makersuite.google.com/app/apikey")
+    print("   Step 2: Create a new API key (FREE)")
+    print("   Step 3: Set environment variable GEMINI_API_KEY")
+    print("          Or edit line 48 in this script")
     sys.exit(1)
 
-# Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Configure Gemini
+genai.configure(api_key=GEMINI_API_KEY)
 
-# LLM Model
-LLM_MODEL = "gpt-4-turbo"  # or "gpt-4", "gpt-3.5-turbo"
+# LLM Model (Using the latest available model)
+LLM_MODEL = "gemini-2.5-flash"
+
+# Initialize Gemini model
+model = genai.GenerativeModel(LLM_MODEL)
 
 # Control interval (how often to query LLM, in seconds)
-LLM_CONTROL_INTERVAL = 20.0  # Query LLM every 20 seconds
+LLM_CONTROL_INTERVAL = 20.0  # Fixed 20s interval
 
 # ================================================
 # Traffic Signal Control Parameters
@@ -84,7 +90,7 @@ PHASE_NAMES = {
 
 # Green time constraints
 MIN_GREEN = 10.0   # 最小綠燈時間（秒）
-MAX_GREEN = 60.0   # 最大綠燈時間（秒）
+MAX_GREEN = 30.0   # 最大綠燈時間（秒）
 YELLOW_TIME = 3.0  # 黃燈時間（秒）
 
 # ================================================
@@ -162,39 +168,34 @@ Available Actions:
 
 def build_RAP_prompt(state):
     """
-    構建 Reasoning + Action Prompt (RAP)
-    
-    Args:
-        state: 交通狀態字典
-        
-    Returns:
-        str: 完整的 prompt
+    構建 Reasoning + Action Prompt (RAP) - Simplified
     """
-    prompt = f"""You are an intelligent traffic signal controller for an urban intersection.
+    prompt = f"""You are an intelligent traffic signal controller.
 
-Your objective is to minimize traffic congestion by reducing queue length and vehicle delay.
-
+Traffic Status:
 {state['text_description']}
 
+Goal: Minimize queue length and delay.
+
+Task: Decide which phase should be active for the next 20 seconds.
+- Option 1: "EB" (East-West Green)
+- Option 2: "SB" (South-North Green)
+
 Instructions:
-1. Analyze the current traffic condition
-2. Compare the two possible actions (EB vs SB)
-3. Choose the best phase to minimize total queue and halting vehicles
-4. Suggest a green light duration between {MIN_GREEN} and {MAX_GREEN} seconds
+1. Analyze the queue and halting vehicles.
+2. If the current green phase still has a long queue, keep it (Extension).
+3. If the waiting phase has a much longer queue, switch to it.
+4. Output JSON only.
 
-Think step-by-step and output your decision in the following format:
-
-Thought: <Your step-by-step reasoning>
-Action: {{"phase": "EB" or "SB", "duration": <number between {MIN_GREEN} and {MAX_GREEN}>}}
-
-IMPORTANT: Your final output MUST include a valid JSON in the Action field.
+Format:
+Thought: <reasoning>
+Action: {{"phase": "EB" or "SB"}}
 """
     return prompt
 
-
 def query_LLM(prompt, max_retries=3):
     """
-    查詢 LLM 並獲取回應
+    查詢 Gemini LLM 並獲取回應
     
     Args:
         prompt: 完整的 prompt
@@ -205,37 +206,37 @@ def query_LLM(prompt, max_retries=3):
     """
     for attempt in range(max_retries):
         try:
-            response = client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a traffic signal control expert."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,  # Lower temperature for more consistent outputs
-                max_tokens=500
+            # Gemini API call
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.3,  # Lower temperature for more consistent outputs
+                    max_output_tokens=500,
+                )
             )
             
-            return response.choices[0].message.content
+            # 成功後稍微等待，避免太快發送下一個請求
+            time.sleep(1.0)
+            return response.text
             
         except Exception as e:
-            print(f"⚠️  LLM API Error (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2)  # Wait before retry
+            print(f"⚠️  Gemini API Error (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            # 如果是 Rate Limit (429)，不要長時間等待，直接 Fallback
+            if "429" in str(e):
+                print(f"   ⚠️ Rate Limit hit! Skipping LLM for this step (Fallback to Max Pressure).")
+                return None
             else:
-                raise
+                if attempt < max_retries - 1:
+                    time.sleep(2)  # Wait before retry
+                else:
+                    return None
     
     return None
 
-
 def parse_LLM_response(response_text):
     """
-    解析 LLM 回應，提取 phase 和 duration
-    
-    Args:
-        response_text: LLM 的完整回應
-        
-    Returns:
-        tuple: (phase, duration, thought) 或 (None, None, None) 如果解析失敗
+    解析 LLM 回應，只提取 phase
     """
     try:
         # 提取 Thought 和 Action
@@ -253,34 +254,23 @@ def parse_LLM_response(response_text):
             elif in_action and line.strip():
                 action_json += " " + line.strip()
         
-        # 嘗試從多種格式中提取 JSON
         if not action_json:
-            # 嘗試直接搜索 JSON
             import re
             json_match = re.search(r'\{[^}]+\}', response_text)
             if json_match:
                 action_json = json_match.group(0)
         
-        # 解析 JSON
         action = json.loads(action_json)
         phase = action.get("phase", "").upper()
-        duration = float(action.get("duration", MIN_GREEN))
         
-        # 驗證 phase
         if phase not in PHASE_MAP:
-            print(f"⚠️  Invalid phase from LLM: {phase}")
-            return None, None, thought
+            return None, thought
         
-        # Clamp duration
-        duration = max(MIN_GREEN, min(MAX_GREEN, duration))
-        
-        return phase, duration, thought
+        return phase, thought
         
     except Exception as e:
-        print(f"⚠️  Failed to parse LLM response: {e}")
-        print(f"   Response: {response_text[:200]}...")
-        return None, None, None
-
+        print(f"⚠️  Failed to parse: {e}")
+        return None, None
 
 # ================================================
 # Fallback Controller (Max Pressure)
@@ -305,87 +295,96 @@ def fallback_max_pressure(state):
     else:
         return "SB", MIN_GREEN + 10.0
 
-
-# ================================================
-# LLM Controller
-# ================================================
-
 def LLM_controller(state):
     """
-    主要的 LLM 控制函數
-    
-    Args:
-        state: 交通狀態
-        
-    Returns:
-        tuple: (phase_index, duration, thought, is_fallback)
+    LLM 控制函數 - 只返回目標相位
     """
     try:
-        # 1. Build prompt
         prompt = build_RAP_prompt(state)
-        
-        # 2. Query LLM
         response = query_LLM(prompt)
         
         if response is None:
-            print("⚠️  LLM query failed, using fallback...")
-            phase, duration = fallback_max_pressure(state)
-            return PHASE_MAP[phase], duration, "Fallback to Max Pressure", True
+            phase = fallback_max_pressure(state) # Fallback returns ("EB", time)
+            return PHASE_MAP[phase[0]], "Fallback (API Fail)", True
         
-        # 3. Parse response
-        phase, duration, thought = parse_LLM_response(response)
+        phase, thought = parse_LLM_response(response)
         
         if phase is None:
-            print("⚠️  LLM response parsing failed, using fallback...")
-            phase, duration = fallback_max_pressure(state)
-            return PHASE_MAP[phase], duration, "Fallback to Max Pressure", True
+            phase = fallback_max_pressure(state)
+            return PHASE_MAP[phase[0]], "Fallback (Parse Fail)", True
         
-        # 4. Return valid decision
-        return PHASE_MAP[phase], duration, thought, False
+        return PHASE_MAP[phase], thought, False
         
     except Exception as e:
-        print(f"⚠️  LLM Controller Error: {e}")
-        phase, duration = fallback_max_pressure(state)
-        return PHASE_MAP[phase], duration, f"Error fallback: {e}", True
+        print(f"⚠️  Error: {e}")
+        phase = fallback_max_pressure(state)
+        return PHASE_MAP[phase[0]], f"Error: {e}", True
 
-
-# ================================================
-# Phase Execution
-# ================================================
-
-def execute_phase(target_phase, duration):
+def execute_phase_fixed_interval(target_phase):
     """
-    執行指定的相位和持續時間
+    執行固定的 20 秒區間
+    """
+    global sum_qEB, sum_qSB, sum_hEB, sum_hSB, sum_halting
+    global eb_green_steps, sb_green_steps, yellow_steps
+    global total_arrived_vehicles, total_steps, cumulative_reward
+    global phase_counts
     
-    Args:
-        target_phase: 目標相位索引 (0 or 2)
-        duration: 綠燈持續時間（秒）
-        
-    Returns:
-        int: 實際執行的 steps 數
-    """
     current_phase = traci.trafficlight.getPhase(TLS_ID)
+    steps_to_run = int(LLM_CONTROL_INTERVAL / STEP_LENGTH)
     
-    # 如果需要切換相位，先切換到黃燈
-    if current_phase != target_phase:
-        # 切換到對應的黃燈相位
-        yellow_phase = target_phase + 1 if target_phase in [0, 2] else target_phase - 1
+    # 定義收集數據函數
+    def step_and_collect():
+        global sum_qEB, sum_qSB, sum_hEB, sum_hSB, sum_halting
+        global eb_green_steps, sb_green_steps, yellow_steps
+        global total_arrived_vehicles, total_steps, cumulative_reward
+        global phase_counts
         
-        # 執行黃燈
-        traci.trafficlight.setPhase(TLS_ID, yellow_phase)
-        yellow_steps = int(YELLOW_TIME / STEP_LENGTH)
-        for _ in range(yellow_steps):
-            traci.simulationStep()
-        
-        # 切換到目標綠燈
-        traci.trafficlight.setPhase(TLS_ID, target_phase)
-    
-    # 執行綠燈階段
-    green_steps = int(duration / STEP_LENGTH)
-    for _ in range(green_steps):
         traci.simulationStep()
+        total_steps += 1
+        
+        state = encode_traffic_state()
+        curr_p = state["current_phase"]
+        
+        # 累積統計
+        sum_qEB += state["queue_EB"]
+        sum_qSB += state["queue_SB"]
+        sum_hEB += state["halting_EB"]
+        sum_hSB += state["halting_SB"]
+        sum_halting += (state["halting_EB"] + state["halting_SB"])
+        
+        if curr_p not in phase_counts: phase_counts[curr_p] = 0
+        phase_counts[curr_p] += 1
+        
+        if curr_p == EB_PHASE: eb_green_steps += 1
+        elif curr_p == SB_PHASE: sb_green_steps += 1
+        else: yellow_steps += 1
+            
+        cumulative_reward += -(state["halting_EB"] + state["halting_SB"])
+        total_arrived_vehicles += traci.simulation.getArrivedNumber()
+
+    # 邏輯：
+    # 1. 如果 Target == Current: 直接跑 20s (Extension)
+    # 2. 如果 Target != Current: 切換 (3s 黃燈) + (17s 綠燈)
     
-    return green_steps
+    if current_phase == target_phase:
+        # 保持當前相位
+        for _ in range(steps_to_run):
+            step_and_collect()
+    else:
+        # 切換相位
+        # 1. 黃燈 (3s)
+        if current_phase in [0, 2]:
+            yellow_phase = current_phase + 1
+            traci.trafficlight.setPhase(TLS_ID, yellow_phase)
+            yellow_steps_duration = int(YELLOW_TIME / STEP_LENGTH)
+            for _ in range(yellow_steps_duration):
+                step_and_collect()
+            steps_to_run -= yellow_steps_duration
+            
+        # 2. 新綠燈 (剩餘時間, 約 17s)
+        traci.trafficlight.setPhase(TLS_ID, target_phase)
+        for _ in range(steps_to_run):
+            step_and_collect()
 
 
 # ================================================
@@ -420,8 +419,8 @@ total_api_time = 0.0
 print("\n" + "="*70)
 print("Starting LLM-Based Traffic Signal Control (RAP Method)")
 print("="*70)
-print(f"Model: {LLM_MODEL}")
-print(f"Control Interval: {LLM_CONTROL_INTERVAL}s")
+print(f"Model: Google {LLM_MODEL}")
+print(f"Control Interval: Fixed {LLM_CONTROL_INTERVAL}s")
 print("="*70 + "\n")
 
 # 啟動 SUMO
@@ -434,88 +433,46 @@ next_control_time = 0.0
 while step < TOTAL_STEPS:
     current_time = step * STEP_LENGTH
     
-    # 檢查是否需要進行 LLM 決策
-    if current_time >= next_control_time:
-        # 1. Encode state
-        state = encode_traffic_state()
-        
-        # 2. Query LLM
-        print(f"\n[t={current_time:.1f}s] Querying LLM...")
-        print(f"  Current: qEB={state['queue_EB']}, qSB={state['queue_SB']}")
-        
-        api_start = time.time()
-        phase_index, duration, thought, is_fallback = LLM_controller(state)
-        api_time = time.time() - api_start
-        
-        total_api_time += api_time
-        api_call_count += 1
-        if is_fallback:
-            fallback_count += 1
-        
-        # 記錄決策
-        decision = {
-            "time": current_time,
-            "state": state,
-            "phase": PHASE_NAMES[phase_index],
-            "duration": duration,
-            "thought": thought,
-            "is_fallback": is_fallback,
-            "api_time": api_time
-        }
-        llm_decisions.append(decision)
-        
-        print(f"  Decision: {PHASE_NAMES[phase_index]}, duration={duration:.1f}s")
-        print(f"  Thought: {thought[:100]}...")
-        if is_fallback:
-            print(f"  ⚠️  FALLBACK")
-        print(f"  API time: {api_time:.2f}s")
-        
-        # 3. Execute phase
-        execute_phase(phase_index, duration)
-        
-        # 更新下次控制時間
-        next_control_time = current_time + LLM_CONTROL_INTERVAL + duration
-        
-        # 更新 step（因為 execute_phase 已經推進了模擬）
-        step = int(traci.simulation.getTime() / STEP_LENGTH)
-    else:
-        # 繼續執行當前相位
-        traci.simulationStep()
-        step += 1
-    
-    # 收集統計數據
+    # 1. Encode state
     state = encode_traffic_state()
-    q_EB = state["queue_EB"]
-    q_SB = state["queue_SB"]
-    h_EB = state["halting_EB"]
-    h_SB = state["halting_SB"]
-    current_phase = state["current_phase"]
     
-    # 累積統計
-    sum_qEB += q_EB
-    sum_qSB += q_SB
-    sum_hEB += h_EB
-    sum_hSB += h_SB
-    sum_halting += (h_EB + h_SB)
-    total_steps += 1
+    # 2. Query LLM (Every 20s)
+    print(f"\n[t={current_time:.1f}s] Querying LLM...")
+    print(f"  Current: qEB={state['queue_EB']}, qSB={state['queue_SB']}")
     
-    # 相位統計
-    if current_phase not in phase_counts:
-        phase_counts[current_phase] = 0
-    phase_counts[current_phase] += 1
+    api_start = time.time()
+    # LLM now only returns target phase
+    phase_index, thought, is_fallback = LLM_controller(state)
+    api_time = time.time() - api_start
     
-    if current_phase == EB_PHASE:
-        eb_green_steps += 1
-    elif current_phase == SB_PHASE:
-        sb_green_steps += 1
-    else:
-        yellow_steps += 1
+    total_api_time += api_time
+    api_call_count += 1
+    if is_fallback:
+        fallback_count += 1
     
-    # Reward
-    reward = -(h_EB + h_SB)
-    cumulative_reward += reward
+    # 記錄決策
+    decision = {
+        "time": current_time,
+        "state": state,
+        "phase": PHASE_NAMES[phase_index],
+        "thought": thought,
+        "is_fallback": is_fallback,
+        "api_time": api_time
+    }
+    llm_decisions.append(decision)
     
-    total_arrived_vehicles += traci.simulation.getArrivedNumber()
+    print(f"  Decision: {PHASE_NAMES[phase_index]}")
+    print(f"  Thought: {thought[:100]}...")
+    if is_fallback:
+        print(f"  ⚠️  FALLBACK")
+    print(f"  API time: {api_time:.2f}s")
+    
+    # 3. Execute Fixed Interval (20s)
+    # This function handles simulation steps and data collection
+    execute_phase_fixed_interval(phase_index)
+    
+    # 更新 step
+    step = int(traci.simulation.getTime() / STEP_LENGTH)
 
 
 # ================================================
