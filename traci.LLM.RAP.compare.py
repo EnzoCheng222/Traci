@@ -41,16 +41,18 @@ Sumo_config = [
 
 # ⚠️ IMPORTANT: Set your Google Gemini API key
 # Get your free API key from: https://makersuite.google.com/app/apikey
-# Option 1: Environment variable (recommended)
-# Option 2: Hardcode here (not recommended for production)
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDqT-0MfSvqSYCqw4RrRKE5j9GIHCGvLG0")
+# Set it as an environment variable: GEMINI_API_KEY
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if GEMINI_API_KEY == "your-gemini-api-key-here":
-    print("⚠️  WARNING: Please set your Google Gemini API key!")
+if not GEMINI_API_KEY:
+    print("⚠️  ERROR: GEMINI_API_KEY environment variable not set!")
     print("   Step 1: Go to https://makersuite.google.com/app/apikey")
     print("   Step 2: Create a new API key (FREE)")
     print("   Step 3: Set environment variable GEMINI_API_KEY")
-    print("          Or edit line 48 in this script")
+    print("   Example (Windows PowerShell):")
+    print("      $env:GEMINI_API_KEY='your-api-key-here'")
+    print("   Example (Linux/Mac):")
+    print("      export GEMINI_API_KEY='your-api-key-here'")
     sys.exit(1)
 
 # Configure Gemini
