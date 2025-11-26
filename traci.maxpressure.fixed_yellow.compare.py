@@ -252,7 +252,7 @@ def max_pressure_control(q_EB, q_SB, curr_phase, step):
 
     # 綠燈階段：Max-Pressure 決策
     target_phase = curr_phase
-    SWITCH_THRESHOLD = 15  # 壓力差閾值：15 輛車
+    SWITCH_THRESHOLD = 0  # 壓力差閾值：0 輛車 (標準 Max-Pressure)
     
     # 計算壓力差
     pressure_diff = abs(q_EB - q_SB)
@@ -343,7 +343,7 @@ for step in range(TOTAL_STEPS):
     # 推進 SUMO 一步
     traci.simulationStep()
 
-    reward = get_reward(q_EB, q_SB)
+    reward = -(h_EB + h_SB)  # 與 PPO 一致：最小化停等車輛數
     cumulative_reward += reward
 
     # Log（每 100 step 約 10 秒印一次）

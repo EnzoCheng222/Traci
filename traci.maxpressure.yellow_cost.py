@@ -353,7 +353,7 @@ for step in range(TOTAL_STEPS):
     # 推進 SUMO 一步
     traci.simulationStep()
 
-    reward = get_reward(q_EB, q_SB)
+    reward = -(h_EB + h_SB)  # 與 PPO 一致：最小化停等車輛數
     cumulative_reward += reward
 
     # Log（每 100 step 約 10 秒印一次）
