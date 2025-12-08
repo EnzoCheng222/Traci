@@ -1,20 +1,65 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2025-11-23 16:33:50 by Eclipse SUMO netedit Version 1.24.0
+<!-- S1：四向均衡
+     EB / WB / SB / NB = 1200 veh/h（中）
+     每方向：左 180 / 直 900 / 右 120
+     轉向比例皆為 15% / 75% / 10%
 -->
 
-<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
-    <!-- Vehicles, persons and containers (sorted by depart) -->
-    <flow id="f_0" begin="0.00" color="red" from="Node1_2_EB" to="Node2_3_EB" end="3600.00" vehsPerHour="1348.31"/>
-    <flow id="f_1" begin="0.00" color="red" from="Node1_2_EB" to="Node2_4_NB" end="3600.00" vehsPerHour="270.07"/>
-    <flow id="f_10" begin="0.00" color="green" from="Node2_3_WB" to="Node2_5_SB" end="3600.00" vehsPerHour="270.07"/>
-    <flow id="f_11" begin="0.00" from="Node2_4_SB" to="Node2_3_EB" end="3600.00" vehsPerHour="270.07"/>
-    <flow id="f_2" begin="0.00" color="red" from="Node1_2_EB" to="Node2_5_SB" end="3600.00" vehsPerHour="180"/>
-    <flow id="f_3" begin="0.00" color="blue" from="Node2_5_NB" to="Node2_3_EB" end="3600.00" vehsPerHour="180"/>
-    <flow id="f_4" begin="0.00" color="green" from="Node2_3_WB" to="Node2_4_NB" end="3600.00" vehsPerHour="180"/>
-    <flow id="f_5" begin="0.00" from="Node2_4_SB" to="Node1_2_WB" end="3600.00" vehsPerHour="180"/>
-    <flow id="f_6" begin="0.00" color="blue" from="Node2_5_NB" to="Node2_4_NB" end="3600.00" vehsPerHour="1348.31"/>
-    <flow id="f_7" begin="0.00" color="green" from="Node2_3_WB" to="Node1_2_WB" end="3600.00" vehsPerHour="1348.31"/>
-    <flow id="f_8" begin="0.00" from="Node2_4_SB" to="Node2_5_SB" end="3600.00" vehsPerHour="1348.31"/>
-    <flow id="f_9" begin="0.00" color="blue" from="Node2_5_NB" to="Node1_2_WB" end="3600.00" vehsPerHour="270.07"/>
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+
+    <!-- 東向 Node1_2_EB：總量 1200 = 左180 / 直900 / 右120 -->
+    <flow id="f_0" begin="0.00" color="red"
+          from="Node1_2_EB" to="Node2_3_EB"
+          end="3600.00" vehsPerHour="900"/>
+    <flow id="f_1" begin="0.00" color="red"
+          from="Node1_2_EB" to="Node2_4_NB"
+          end="3600.00" vehsPerHour="180"/>
+    <flow id="f_2" begin="0.00" color="red"
+          from="Node1_2_EB" to="Node2_5_SB"
+          end="3600.00" vehsPerHour="120"/>
+
+    <!-- 北向 Node2_5_NB：總量 1200 = 左180 / 直900 / 右120 -->
+    <!-- NB → 右轉 → Node2_3_EB -->
+    <flow id="f_3" begin="0.00" color="blue"
+          from="Node2_5_NB" to="Node2_3_EB"
+          end="3600.00" vehsPerHour="120"/>
+    <!-- NB → 直行 → Node2_4_NB -->
+    <flow id="f_6" begin="0.00" color="blue"
+          from="Node2_5_NB" to="Node2_4_NB"
+          end="3600.00" vehsPerHour="900"/>
+    <!-- NB → 左轉 → Node1_2_WB -->
+    <flow id="f_9" begin="0.00" color="blue"
+          from="Node2_5_NB" to="Node1_2_WB"
+          end="3600.00" vehsPerHour="180"/>
+
+    <!-- 西向 Node2_3_WB：總量 1200 = 左180 / 直900 / 右120 -->
+    <!-- WB → 左轉 → Node2_5_SB -->
+    <flow id="f_10" begin="0.00" color="green"
+          from="Node2_3_WB" to="Node2_5_SB"
+          end="3600.00" vehsPerHour="180"/>
+    <!-- WB → 直行 → Node1_2_WB -->
+    <flow id="f_7" begin="0.00" color="green"
+          from="Node2_3_WB" to="Node1_2_WB"
+          end="3600.00" vehsPerHour="900"/>
+    <!-- WB → 右轉 → Node2_4_NB -->
+    <flow id="f_4" begin="0.00" color="green"
+          from="Node2_3_WB" to="Node2_4_NB"
+          end="3600.00" vehsPerHour="120"/>
+
+    <!-- 南向 Node2_4_SB：總量 1200 = 左180 / 直900 / 右120 -->
+    <!-- SB → 左轉 → Node2_3_EB -->
+    <flow id="f_11" begin="0.00"
+          from="Node2_4_SB" to="Node2_3_EB"
+          end="3600.00" vehsPerHour="180"/>
+    <!-- SB → 直行 → Node2_5_SB -->
+    <flow id="f_8" begin="0.00"
+          from="Node2_4_SB" to="Node2_5_SB"
+          end="3600.00" vehsPerHour="900"/>
+    <!-- SB → 右轉 → Node1_2_WB -->
+    <flow id="f_5" begin="0.00"
+          from="Node2_4_SB" to="Node1_2_WB"
+          end="3600.00" vehsPerHour="120"/>
+
 </routes>

@@ -1,554 +1,503 @@
 # ================================
-# LLM-Based Traffic Signal Control (RAP Method)
-# Based on "Large Language Models as Traffic Signal Control Agents" (arXiv:2312.16044v5)
+# LLM-Based Traffic Signal Control (Protected Left, 8 Phases)
+# - LLM 每一個 group 結束時選「下一個 group」
+# - group = {NS_STRAIGHT, NS_LEFT, EW_STRAIGHT, EW_LEFT}
+# - 直接控制 8 相位 RYG（跟你 PPO 版本同一組 PHASE_CYCLE）
+# - 結尾輸出平均排隊 / 停等 / Delay 等統計
 # ================================
 
 import os
 import sys
-import json
 import time
+import json
+import re
+from collections import defaultdict
+
 import google.generativeai as genai
 
-# 取得程式所在資料夾
+# -------------------------
+# 基本參數
+# -------------------------
+
+SIM_TIME = 1800.0
+STEP_LENGTH = 0.10
+TOTAL_STEPS = int(SIM_TIME / STEP_LENGTH)
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 建立 SUMO 路徑
-if 'SUMO_HOME' in os.environ:
-    tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
-    sys.path.append(tools)
-else:
-    sys.exit("Please declare environment variable 'SUMO_HOME'")
+# SUMO 路徑
+if "SUMO_HOME" not in os.environ:
+    sys.exit("請先設定環境變數 SUMO_HOME")
+tools = os.path.join(os.environ["SUMO_HOME"], "tools")
+sys.path.append(tools)
 
-import traci
+import traci  # noqa
 
-# SUMO 設定檔
-sumocfg_path = os.path.join(SCRIPT_DIR, 'Traci.sumocfg')
-
+sumocfg_path = os.path.join(SCRIPT_DIR, "Traci.sumocfg")
 if not os.path.exists(sumocfg_path):
     sys.exit(f"找不到 SUMO 設定檔: {sumocfg_path}")
 
-Sumo_config = [
-    'sumo-gui',
-    '-c', sumocfg_path,
-    '--step-length', '0.10',
-    '--delay', '0',
-    '--lateral-resolution', '0'
+SUMO_CONFIG = [
+    "sumo-gui",
+    "-c", sumocfg_path,
+    "--step-length", str(STEP_LENGTH),
+    "--delay", "0",
+    "--lateral-resolution", "0"
 ]
 
-# ================================================
-# Google Gemini Configuration
-# ================================================
+TLS_ID = "Node2"
 
-# ⚠️ IMPORTANT: Set your Google Gemini API key
-# Get your free API key from: https://makersuite.google.com/app/apikey
-# Set it as an environment variable: GEMINI_API_KEY
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# -------------------------
+# 8 相位（完全沿用你 PPO 的設定）
+# duration 單位 = simulation steps (0.1s)
+# -------------------------
 
-if not GEMINI_API_KEY:
-    print("⚠️  ERROR: GEMINI_API_KEY environment variable not set!")
-    print("   Step 1: Go to https://makersuite.google.com/app/apikey")
-    print("   Step 2: Create a new API key (FREE)")
-    print("   Step 3: Set environment variable GEMINI_API_KEY")
-    print("   Example (Windows PowerShell):")
-    print("      $env:GEMINI_API_KEY='your-api-key-here'")
-    print("   Example (Linux/Mac):")
-    print("      export GEMINI_API_KEY='your-api-key-here'")
-    sys.exit(1)
+PHASE_CYCLE = [
+    # 0: NS Straight (Green)
+    {"duration": 300, "state": "GGGGrrrrrrGGGGrrrrrr", "name": "NS Straight"},
+    # 1: NS Straight (Yellow)
+    {"duration": 30,  "state": "yyyyrrrrrryyyyrrrrrr", "name": "NS Straight (Y)"},
+    # 2: NS Left (Green)
+    {"duration": 150, "state": "rrrrGrrrrrrrrrGrrrrr", "name": "NS Left"},
+    # 3: NS Left (Yellow)
+    {"duration": 30,  "state": "rrrryrrrrrrrrryrrrrr", "name": "NS Left (Y)"},
+    # 4: EW Straight (Green)
+    {"duration": 300, "state": "rrrrrGGGGrrrrrGGGGrr", "name": "EW Straight"},
+    # 5: EW Straight (Yellow)
+    {"duration": 30,  "state": "rrrrryyyyrrrrryyyyrr", "name": "EW Straight (Y)"},
+    # 6: EW Left (Green)
+    {"duration": 150, "state": "rrrrrrrrrGrrrrrrrrrG", "name": "EW Left"},
+    # 7: EW Left (Yellow)
+    {"duration": 30,  "state": "rrrrrrrrryrrrrrrrrry", "name": "EW Left (Y)"}
+]
 
-# Configure Gemini
-genai.configure(api_key=GEMINI_API_KEY)
+NS_STRAIGHT_PHASES = [0, 1]
+NS_LEFT_PHASES     = [2, 3]
+EW_STRAIGHT_PHASES = [4, 5]
+EW_LEFT_PHASES     = [6, 7]
 
-# LLM Model (Using the latest available model)
+GROUP_TO_PHASE = {
+    "NS_STRAIGHT": 0,
+    "NS_LEFT": 2,
+    "EW_STRAIGHT": 4,
+    "EW_LEFT": 6
+}
+
+GROUP_LIST = ["NS_STRAIGHT", "NS_LEFT", "EW_STRAIGHT", "EW_LEFT"]
+
+# -------------------------
+# LLM 設定（依你要求寫死 key）
+# -------------------------
+
+genai.configure(api_key="AIzaSyDqT-0MfSvqSYCqw4RrRKE5j9GIHCGvLG0")
 LLM_MODEL = "gemini-2.5-flash"
-
-# Initialize Gemini model
 model = genai.GenerativeModel(LLM_MODEL)
 
-# Control interval (how often to query LLM, in seconds)
-LLM_CONTROL_INTERVAL = 20.0  # Fixed 20s interval
+api_call_count = 0
+fallback_count = 0
+total_api_time = 0.0
 
-# ================================================
-# Traffic Signal Control Parameters
-# ================================================
+# -------------------------
+# 車道紀律（跟 PPO 一樣）
+# -------------------------
 
-TLS_ID = "Node2"
-STEP_LENGTH = 0.1           # 秒/step
-SIM_TIME = 1800.0           # 總模擬時間（秒）
-TOTAL_STEPS = int(SIM_TIME / STEP_LENGTH)
+def enforce_lane_discipline():
+    edges = ["Node1_2_EB", "Node2_3_WB", "Node2_4_SB", "Node2_5_NB"]
+    for edge in edges:
+        for vid in traci.edge.getLastStepVehicleIDs(edge):
+            try:
+                route = traci.vehicle.getRoute(vid)
+                if len(route) < 2:
+                    continue
+                cur_idx = route.index(edge)
+                if cur_idx + 1 >= len(route):
+                    continue
+                nxt = route[cur_idx + 1]
+                lane = traci.vehicle.getLaneIndex(vid)
 
-# Phase definitions (4-phase system)
-EB_PHASE = 0   # 東西向綠燈
-SB_PHASE = 2   # 南北向綠燈
+                straight = (
+                    (edge == "Node1_2_EB" and nxt == "Node2_3_EB") or
+                    (edge == "Node2_3_WB" and nxt == "Node1_2_WB") or
+                    (edge == "Node2_4_SB" and nxt == "Node2_5_SB") or
+                    (edge == "Node2_5_NB" and nxt == "Node2_4_NB")
+                )
+                left = (
+                    (edge == "Node1_2_EB" and nxt == "Node2_4_NB") or
+                    (edge == "Node2_3_WB" and nxt == "Node2_5_SB") or
+                    (edge == "Node2_4_SB" and nxt == "Node2_3_EB") or
+                    (edge == "Node2_5_NB" and nxt == "Node1_2_WB")
+                )
 
-PHASE_MAP = {
-    "EB": 0,
-    "SB": 2
-}
+                if straight and lane == 2:
+                    traci.vehicle.changeLane(vid, 1, 3.0)
+                elif left and lane != 2:
+                    traci.vehicle.changeLane(vid, 2, 3.0)
+            except Exception:
+                pass
 
-PHASE_NAMES = {
-    0: "EB (East-West)",
-    2: "SB (South-North)"
-}
+# -------------------------
+# 狀態讀取（含直行/左轉、各向 queue / halting）
+# -------------------------
 
-# Green time constraints
-MIN_GREEN = 10.0   # 最小綠燈時間（秒）
-MAX_GREEN = 30.0   # 最大綠燈時間（秒）
-YELLOW_TIME = 3.0  # 黃燈時間（秒）
-
-# ================================================
-# State Encoder
-# ================================================
-
-def encode_traffic_state():
-    """
-    將當前交通狀態編碼為自然語言描述
-    
-    Returns:
-        dict: 包含交通狀態和文字描述的字典
-    """
-    # 讀取 EB 方向數據
+def get_full_stats():
+    # EB
     q_EB_0 = traci.lanearea.getLastStepVehicleNumber("Node1_2_EB_0")
     q_EB_1 = traci.lanearea.getLastStepVehicleNumber("Node1_2_EB_1")
     q_EB_2 = traci.lanearea.getLastStepVehicleNumber("Node1_2_EB_2")
-    
     h_EB_0 = traci.lanearea.getLastStepHaltingNumber("Node1_2_EB_0")
     h_EB_1 = traci.lanearea.getLastStepHaltingNumber("Node1_2_EB_1")
     h_EB_2 = traci.lanearea.getLastStepHaltingNumber("Node1_2_EB_2")
-    
-    # 讀取 SB 方向數據
+
+    # WB
+    q_WB_0 = traci.lanearea.getLastStepVehicleNumber("Node2_3_WB_0")
+    q_WB_1 = traci.lanearea.getLastStepVehicleNumber("Node2_3_WB_1")
+    q_WB_2 = traci.lanearea.getLastStepVehicleNumber("Node2_3_WB_2")
+    h_WB_0 = traci.lanearea.getLastStepHaltingNumber("Node2_3_WB_0")
+    h_WB_1 = traci.lanearea.getLastStepHaltingNumber("Node2_3_WB_1")
+    h_WB_2 = traci.lanearea.getLastStepHaltingNumber("Node2_3_WB_2")
+
+    # SB
     q_SB_0 = traci.lanearea.getLastStepVehicleNumber("Node2_4_SB_0")
     q_SB_1 = traci.lanearea.getLastStepVehicleNumber("Node2_4_SB_1")
     q_SB_2 = traci.lanearea.getLastStepVehicleNumber("Node2_4_SB_2")
-    
     h_SB_0 = traci.lanearea.getLastStepHaltingNumber("Node2_4_SB_0")
     h_SB_1 = traci.lanearea.getLastStepHaltingNumber("Node2_4_SB_1")
     h_SB_2 = traci.lanearea.getLastStepHaltingNumber("Node2_4_SB_2")
-    
-    # 總計
-    q_EB = q_EB_0 + q_EB_1 + q_EB_2
-    q_SB = q_SB_0 + q_SB_1 + q_SB_2
-    h_EB = h_EB_0 + h_EB_1 + h_EB_2
-    h_SB = h_SB_0 + h_SB_1 + h_SB_2
-    
-    # 當前相位和持續時間
-    current_phase = traci.trafficlight.getPhase(TLS_ID)
-    
-    state = {
-        "queue_EB": q_EB,
-        "queue_SB": q_SB,
-        "halting_EB": h_EB,
-        "halting_SB": h_SB,
-        "current_phase": current_phase,
-        "current_phase_name": PHASE_NAMES.get(current_phase, f"Phase {current_phase}")
+
+    # NB
+    q_NB_0 = traci.lanearea.getLastStepVehicleNumber("Node2_5_NB_0")
+    q_NB_1 = traci.lanearea.getLastStepVehicleNumber("Node2_5_NB_1")
+    q_NB_2 = traci.lanearea.getLastStepVehicleNumber("Node2_5_NB_2")
+    h_NB_0 = traci.lanearea.getLastStepHaltingNumber("Node2_5_NB_0")
+    h_NB_1 = traci.lanearea.getLastStepHaltingNumber("Node2_5_NB_1")
+    h_NB_2 = traci.lanearea.getLastStepHaltingNumber("Node2_5_NB_2")
+
+    q_EB_s = q_EB_0 + q_EB_1
+    q_EB_l = q_EB_2
+    q_WB_s = q_WB_0 + q_WB_1
+    q_WB_l = q_WB_2
+    q_SB_s = q_SB_0 + q_SB_1
+    q_SB_l = q_SB_2
+    q_NB_s = q_NB_0 + q_NB_1
+    q_NB_l = q_NB_2
+
+    h_EB_s = h_EB_0 + h_EB_1
+    h_EB_l = h_EB_2
+    h_WB_s = h_WB_0 + h_WB_1
+    h_WB_l = h_WB_2
+    h_SB_s = h_SB_0 + h_SB_1
+    h_SB_l = h_SB_2
+    h_NB_s = h_NB_0 + h_NB_1
+    h_NB_l = h_NB_2
+
+    q_EB = q_EB_s + q_EB_l
+    q_WB = q_WB_s + q_WB_l
+    q_SB = q_SB_s + q_SB_l
+    q_NB = q_NB_s + q_NB_l
+
+    h_EB = h_EB_s + h_EB_l
+    h_WB = h_WB_s + h_WB_l
+    h_SB = h_SB_s + h_SB_l
+    h_NB = h_NB_s + h_NB_l
+
+    stats = {
+        "q_EB": q_EB, "q_WB": q_WB, "q_SB": q_SB, "q_NB": q_NB,
+        "h_EB": h_EB, "h_WB": h_WB, "h_SB": h_SB, "h_NB": h_NB,
+        "q_EB_s": q_EB_s, "q_EB_l": q_EB_l,
+        "q_WB_s": q_WB_s, "q_WB_l": q_WB_l,
+        "q_SB_s": q_SB_s, "q_SB_l": q_SB_l,
+        "q_NB_s": q_NB_s, "q_NB_l": q_NB_l,
+        "h_EB_s": h_EB_s, "h_EB_l": h_EB_l,
+        "h_WB_s": h_WB_s, "h_WB_l": h_WB_l,
+        "h_SB_s": h_SB_s, "h_SB_l": h_SB_l,
+        "h_NB_s": h_NB_s, "h_NB_l": h_NB_l,
     }
-    
-    # 生成自然語言描述
-    text_description = f"""Traffic Condition at Node2:
 
-East-West Direction (EB):
-  - Queue length: {q_EB} vehicles
-  - Halting vehicles: {h_EB} vehicles
+    stats["q_NS_s"] = q_SB_s + q_NB_s
+    stats["q_NS_l"] = q_SB_l + q_NB_l
+    stats["q_EW_s"] = q_EB_s + q_WB_s
+    stats["q_EW_l"] = q_EB_l + q_WB_l
 
-South-North Direction (SB):
-  - Queue length: {q_SB} vehicles
-  - Halting vehicles: {h_SB} vehicles
+    stats["q_total"] = q_EB + q_WB + q_SB + q_NB
+    stats["h_total"] = h_EB + h_WB + h_SB + h_NB
 
-Current Signal Phase: {state['current_phase_name']}
+    return stats
 
-Available Actions:
-  - "EB": Give green light to East-West direction
-  - "SB": Give green light to South-North direction
+# -------------------------
+# LLM 部分
+# -------------------------
+
+def build_llm_prompt(stats, current_group, sim_time):
+    return f"""
+You control a 4-approach intersection with protected left-turn phases (8 total phases).
+
+Current time: {sim_time:.1f} s
+Current group: {current_group}
+
+Queues (vehicles):
+  NS_STRAIGHT = {stats['q_NS_s']}
+  NS_LEFT     = {stats['q_NS_l']}
+  EW_STRAIGHT = {stats['q_EW_s']}
+  EW_LEFT     = {stats['q_EW_l']}
+
+Goal:
+- Minimize total queue and stopped vehicles over the whole simulation.
+- For S1 (balanced) scenario, all directions have similar demand.
+- At each decision, choose the movement group that should receive the NEXT full green+yellow cycle.
+
+Valid options (exact strings):
+  "NS_STRAIGHT"
+  "NS_LEFT"
+  "EW_STRAIGHT"
+  "EW_LEFT"
+
+Return ONLY one JSON object, no explanation, no extra text:
+{{"group": "NS_STRAIGHT"}}
+or
+{{"group": "NS_LEFT"}}
+or
+{{"group": "EW_STRAIGHT"}}
+or
+{{"group": "EW_LEFT"}}
 """
-    
-    state["text_description"] = text_description
-    return state
 
-
-# ================================================
-# LLM Decision Module (RAP Method)
-# ================================================
-
-def build_RAP_prompt(state):
-    """
-    構建 Reasoning + Action Prompt (RAP) - Simplified
-    """
-    prompt = f"""You are an intelligent traffic signal controller.
-
-Traffic Status:
-{state['text_description']}
-
-Goal: Minimize queue length and delay.
-
-Task: Decide which phase should be active for the next 20 seconds.
-- Option 1: "EB" (East-West Green)
-- Option 2: "SB" (South-North Green)
-
-Instructions:
-1. Analyze the queue and halting vehicles.
-2. If the current green phase still has a long queue, keep it (Extension).
-3. If the waiting phase has a much longer queue, switch to it.
-4. Output JSON only.
-
-Format:
-Thought: <reasoning>
-Action: {{"phase": "EB" or "SB"}}
-"""
-    return prompt
-
-def query_LLM(prompt, max_retries=3):
-    """
-    查詢 Gemini LLM 並獲取回應
-    
-    Args:
-        prompt: 完整的 prompt
-        max_retries: 最大重試次數
-        
-    Returns:
-        str: LLM 的回應文字
-    """
-    for attempt in range(max_retries):
-        try:
-            # Gemini API call
-            response = model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.3,  # Lower temperature for more consistent outputs
-                    max_output_tokens=500,
-                )
-            )
-            
-            # 成功後稍微等待，避免太快發送下一個請求
-            time.sleep(1.0)
-            return response.text
-            
-        except Exception as e:
-            print(f"⚠️  Gemini API Error (attempt {attempt + 1}/{max_retries}): {e}")
-            
-            # 如果是 Rate Limit (429)，不要長時間等待，直接 Fallback
-            if "429" in str(e):
-                print(f"   ⚠️ Rate Limit hit! Skipping LLM for this step (Fallback to Max Pressure).")
-                return None
-            else:
-                if attempt < max_retries - 1:
-                    time.sleep(2)  # Wait before retry
-                else:
-                    return None
-    
-    return None
-
-def parse_LLM_response(response_text):
-    """
-    解析 LLM 回應，只提取 phase
-    """
+def call_llm(prompt):
+    global api_call_count, total_api_time
     try:
-        # 提取 Thought 和 Action
-        lines = response_text.split("\n")
-        thought = ""
-        action_json = ""
-        
-        in_action = False
-        for line in lines:
-            if line.strip().startswith("Thought:"):
-                thought = line.replace("Thought:", "").strip()
-            elif line.strip().startswith("Action:"):
-                action_json = line.replace("Action:", "").strip()
-                in_action = True
-            elif in_action and line.strip():
-                action_json += " " + line.strip()
-        
-        if not action_json:
-            import re
-            json_match = re.search(r'\{[^}]+\}', response_text)
-            if json_match:
-                action_json = json_match.group(0)
-        
-        action = json.loads(action_json)
-        phase = action.get("phase", "").upper()
-        
-        if phase not in PHASE_MAP:
-            return None, thought
-        
-        return phase, thought
-        
+        start = time.time()
+        resp = model.generate_content(
+            prompt,
+            generation_config={"temperature": 0.2, "max_output_tokens": 32}
+        )
+        total_api_time += (time.time() - start)
+        api_call_count += 1
     except Exception as e:
-        print(f"⚠️  Failed to parse: {e}")
-        return None, None
+        print("⚠️ LLM Error:", e)
+        return None
 
-# ================================================
-# Fallback Controller (Max Pressure)
-# ================================================
+    text = ""
+    if resp.candidates:
+        for c in resp.candidates:
+            if c.content and c.content.parts:
+                for p in c.content.parts:
+                    if hasattr(p, "text") and p.text:
+                        text += p.text.strip()
+    return text.strip() if text.strip() else None
 
-def fallback_max_pressure(state):
-    """
-    Fallback 到 Max Pressure 演算法
-    
-    Args:
-        state: 交通狀態
-        
-    Returns:
-        tuple: (phase, duration)
-    """
-    q_EB = state["queue_EB"]
-    q_SB = state["queue_SB"]
-    
-    # Max Pressure: 選擇壓力大的方向
-    if q_EB > q_SB:
-        return "EB", MIN_GREEN + 10.0
-    else:
-        return "SB", MIN_GREEN + 10.0
-
-def LLM_controller(state):
-    """
-    LLM 控制函數 - 只返回目標相位
-    """
+def parse_llm_group(resp_text):
+    if not resp_text:
+        return None
     try:
-        prompt = build_RAP_prompt(state)
-        response = query_LLM(prompt)
-        
-        if response is None:
-            phase = fallback_max_pressure(state) # Fallback returns ("EB", time)
-            return PHASE_MAP[phase[0]], "Fallback (API Fail)", True
-        
-        phase, thought = parse_LLM_response(response)
-        
-        if phase is None:
-            phase = fallback_max_pressure(state)
-            return PHASE_MAP[phase[0]], "Fallback (Parse Fail)", True
-        
-        return PHASE_MAP[phase], thought, False
-        
-    except Exception as e:
-        print(f"⚠️  Error: {e}")
-        phase = fallback_max_pressure(state)
-        return PHASE_MAP[phase[0]], f"Error: {e}", True
+        m = re.search(r"\{.*\}", resp_text, re.DOTALL)
+        if not m:
+            return None
+        obj = json.loads(m.group(0))
+        g = obj.get("group", "").strip().upper()
+        if g in GROUP_TO_PHASE:
+            return g
+        return None
+    except Exception:
+        return None
 
-def execute_phase_fixed_interval(target_phase):
-    """
-    執行固定的 20 秒區間
-    """
-    global sum_qEB, sum_qSB, sum_hEB, sum_hSB, sum_halting
-    global eb_green_steps, sb_green_steps, yellow_steps
-    global total_arrived_vehicles, total_steps, cumulative_reward
-    global phase_counts
-    
-    current_phase = traci.trafficlight.getPhase(TLS_ID)
-    steps_to_run = int(LLM_CONTROL_INTERVAL / STEP_LENGTH)
-    
-    # 定義收集數據函數
-    def step_and_collect():
-        global sum_qEB, sum_qSB, sum_hEB, sum_hSB, sum_halting
-        global eb_green_steps, sb_green_steps, yellow_steps
-        global total_arrived_vehicles, total_steps, cumulative_reward
-        global phase_counts
-        
+# -------------------------
+# fallback：Max-Pressure-like
+# -------------------------
+
+def fallback_group(stats):
+    global fallback_count
+    fallback_count += 1
+    pressures = {
+        "NS_STRAIGHT": stats["q_NS_s"],
+        "NS_LEFT":     stats["q_NS_l"],
+        "EW_STRAIGHT": stats["q_EW_s"],
+        "EW_LEFT":     stats["q_EW_l"],
+    }
+    return max(pressures, key=pressures.get)
+
+# -------------------------
+# 主程式
+# -------------------------
+
+def main():
+    global api_call_count, fallback_count, total_api_time
+
+    if traci.isLoaded():
+        traci.close()
+    traci.start(SUMO_CONFIG)
+
+    try:
+        traci.gui.setSchema("View #0", "real world")
+    except Exception:
+        pass
+
+    current_group = "NS_STRAIGHT"
+    current_phase = GROUP_TO_PHASE[current_group]
+    steps_in_phase = 0
+
+    traci.trafficlight.setRedYellowGreenState(TLS_ID, PHASE_CYCLE[current_phase]["state"])
+
+    # 統計變數
+    sum_qEB = sum_qWB = sum_qSB = sum_qNB = 0.0
+    sum_hEB = sum_hWB = sum_hSB = sum_hNB = 0.0
+    sum_halting = 0.0
+    total_steps = 0
+    total_arrived_vehicles = 0
+    cumulative_reward = 0.0
+
+    ns_green_steps = 0
+    ew_green_steps = 0
+    yellow_steps = 0
+    phase_counts = defaultdict(int)
+
+    for step in range(TOTAL_STEPS):
+        sim_time = step * STEP_LENGTH
+
+        if step % int(1.0 / STEP_LENGTH) == 0:
+            enforce_lane_discipline()
+
         traci.simulationStep()
         total_steps += 1
-        
-        state = encode_traffic_state()
-        curr_p = state["current_phase"]
-        
-        # 累積統計
-        sum_qEB += state["queue_EB"]
-        sum_qSB += state["queue_SB"]
-        sum_hEB += state["halting_EB"]
-        sum_hSB += state["halting_SB"]
-        sum_halting += (state["halting_EB"] + state["halting_SB"])
-        
-        if curr_p not in phase_counts: phase_counts[curr_p] = 0
-        phase_counts[curr_p] += 1
-        
-        if curr_p == EB_PHASE: eb_green_steps += 1
-        elif curr_p == SB_PHASE: sb_green_steps += 1
-        else: yellow_steps += 1
-            
-        cumulative_reward += -(state["halting_EB"] + state["halting_SB"])
         total_arrived_vehicles += traci.simulation.getArrivedNumber()
 
-    # 邏輯：
-    # 1. 如果 Target == Current: 直接跑 20s (Extension)
-    # 2. 如果 Target != Current: 切換 (3s 黃燈) + (17s 綠燈)
-    
-    if current_phase == target_phase:
-        # 保持當前相位
-        for _ in range(steps_to_run):
-            step_and_collect()
+        stats = get_full_stats()
+
+        sum_qEB += stats["q_EB"]
+        sum_qWB += stats["q_WB"]
+        sum_qSB += stats["q_SB"]
+        sum_qNB += stats["q_NB"]
+
+        sum_hEB += stats["h_EB"]
+        sum_hWB += stats["h_WB"]
+        sum_hSB += stats["h_SB"]
+        sum_hNB += stats["h_NB"]
+
+        sum_halting += stats["h_total"]
+        cumulative_reward += -float(stats["h_total"])
+
+        phase_name = PHASE_CYCLE[current_phase]["name"]
+        phase_counts[phase_name] += 1
+
+        if current_phase in [0, 2]:   # NS 綠燈
+            ns_green_steps += 1
+        if current_phase in [4, 6]:   # EW 綠燈
+            ew_green_steps += 1
+        if current_phase in [1, 3, 5, 7]:
+            yellow_steps += 1
+
+        if step % 100 == 0:
+            print(f"[t={sim_time:4.1f}s] Phase={phase_name} | "
+                  f"qEB={stats['q_EB']:2d}, qWB={stats['q_WB']:2d}, "
+                  f"qSB={stats['q_SB']:2d}, qNB={stats['q_NB']:2d}")
+
+        steps_in_phase += 1
+        phase_dur = PHASE_CYCLE[current_phase]["duration"]
+
+        if steps_in_phase >= phase_dur:
+            steps_in_phase = 0
+
+            # group 結尾（黃燈結束）→ LLM 決策下一個 group
+            if current_phase in [1, 3, 5, 7]:
+                print(f"\n[t={sim_time:4.1f}s] === Group {current_group} finished, deciding NEXT group ===")
+                print(f"   Queues: NS_s={stats['q_NS_s']}, NS_l={stats['q_NS_l']}, "
+                      f"EW_s={stats['q_EW_s']}, EW_l={stats['q_EW_l']}")
+
+                prompt = build_llm_prompt(stats, current_group, sim_time)
+                resp_text = call_llm(prompt)
+                chosen_group = parse_llm_group(resp_text)
+
+                if chosen_group is None:
+                    chosen_group = fallback_group(stats)
+                    print(f"   → Fallback selected group: {chosen_group}")
+                else:
+                    print(f"   → LLM selected group: {chosen_group}")
+
+                current_group = chosen_group
+                current_phase = GROUP_TO_PHASE[current_group]
+
+            else:
+                if current_phase in NS_STRAIGHT_PHASES:
+                    seq = NS_STRAIGHT_PHASES
+                elif current_phase in NS_LEFT_PHASES:
+                    seq = NS_LEFT_PHASES
+                elif current_phase in EW_STRAIGHT_PHASES:
+                    seq = EW_STRAIGHT_PHASES
+                else:
+                    seq = EW_LEFT_PHASES
+
+                idx = seq.index(current_phase)
+                current_phase = seq[(idx + 1) % len(seq)]
+
+            traci.trafficlight.setRedYellowGreenState(TLS_ID, PHASE_CYCLE[current_phase]["state"])
+
+    traci.close()
+
+    print("\n=== Simulation completed. ===\n")
+
+    if total_steps > 0:
+        avg_qEB = sum_qEB / total_steps
+        avg_qWB = sum_qWB / total_steps
+        avg_qSB = sum_qSB / total_steps
+        avg_qNB = sum_qNB / total_steps
+
+        avg_hEB = sum_hEB / total_steps
+        avg_hWB = sum_hWB / total_steps
+        avg_hSB = sum_hSB / total_steps
+        avg_hNB = sum_hNB / total_steps
+
+        avg_queue_total = (sum_qEB + sum_qWB + sum_qSB + sum_qNB) / total_steps
+        total_waiting_time = sum_halting * STEP_LENGTH
+
+        if total_arrived_vehicles > 0:
+            avg_delay_time = total_waiting_time / total_arrived_vehicles
+        else:
+            avg_delay_time = 0.0
+
+        ns_green_ratio = ns_green_steps / total_steps
+        ew_green_ratio = ew_green_steps / total_steps
+        yellow_ratio = yellow_steps / total_steps
     else:
-        # 切換相位
-        # 1. 黃燈 (3s)
-        if current_phase in [0, 2]:
-            yellow_phase = current_phase + 1
-            traci.trafficlight.setPhase(TLS_ID, yellow_phase)
-            yellow_steps_duration = int(YELLOW_TIME / STEP_LENGTH)
-            for _ in range(yellow_steps_duration):
-                step_and_collect()
-            steps_to_run -= yellow_steps_duration
-            
-        # 2. 新綠燈 (剩餘時間, 約 17s)
-        traci.trafficlight.setPhase(TLS_ID, target_phase)
-        for _ in range(steps_to_run):
-            step_and_collect()
-
-
-# ================================================
-# 統計變數
-# ================================================
-
-sum_qEB = 0.0
-sum_qSB = 0.0
-sum_hEB = 0.0
-sum_hSB = 0.0
-sum_halting = 0.0
-eb_green_steps = 0
-sb_green_steps = 0
-yellow_steps = 0
-phase_counts = {}
-total_arrived_vehicles = 0
-total_steps = 0
-cumulative_reward = 0.0
-
-# LLM 控制歷史
-control_history = []
-llm_decisions = []
-fallback_count = 0
-api_call_count = 0
-total_api_time = 0.0
-
-
-# ================================================
-# 主控制迴圈
-# ================================================
-
-print("\n" + "="*70)
-print("Starting LLM-Based Traffic Signal Control (RAP Method)")
-print("="*70)
-print(f"Model: Google {LLM_MODEL}")
-print(f"Control Interval: Fixed {LLM_CONTROL_INTERVAL}s")
-print("="*70 + "\n")
-
-# 啟動 SUMO
-traci.start(Sumo_config)
-traci.gui.setSchema("View #0", "real world")
-
-step = 0
-next_control_time = 0.0
-
-while step < TOTAL_STEPS:
-    current_time = step * STEP_LENGTH
-    
-    # 1. Encode state
-    state = encode_traffic_state()
-    
-    # 2. Query LLM (Every 20s)
-    print(f"\n[t={current_time:.1f}s] Querying LLM...")
-    print(f"  Current: qEB={state['queue_EB']}, qSB={state['queue_SB']}")
-    
-    api_start = time.time()
-    # LLM now only returns target phase
-    phase_index, thought, is_fallback = LLM_controller(state)
-    api_time = time.time() - api_start
-    
-    total_api_time += api_time
-    api_call_count += 1
-    if is_fallback:
-        fallback_count += 1
-    
-    # 記錄決策
-    decision = {
-        "time": current_time,
-        "state": state,
-        "phase": PHASE_NAMES[phase_index],
-        "thought": thought,
-        "is_fallback": is_fallback,
-        "api_time": api_time
-    }
-    llm_decisions.append(decision)
-    
-    print(f"  Decision: {PHASE_NAMES[phase_index]}")
-    print(f"  Thought: {thought[:100]}...")
-    if is_fallback:
-        print(f"  ⚠️  FALLBACK")
-    print(f"  API time: {api_time:.2f}s")
-    
-    # 3. Execute Fixed Interval (20s)
-    # This function handles simulation steps and data collection
-    execute_phase_fixed_interval(phase_index)
-    
-    # 更新 step
-    step = int(traci.simulation.getTime() / STEP_LENGTH)
-
-
-# ================================================
-# 結束模擬
-# ================================================
-
-traci.close()
-
-print("\n" + "="*70)
-print("Simulation completed.")
-print("="*70 + "\n")
-
-
-# ================================================
-# 輸出統計結果
-# ================================================
-
-if total_steps > 0:
-    avg_qEB = sum_qEB / total_steps
-    avg_qSB = sum_qSB / total_steps
-    avg_hEB = sum_hEB / total_steps
-    avg_hSB = sum_hSB / total_steps
-
-    eb_green_ratio = eb_green_steps / total_steps
-    sb_green_ratio = sb_green_steps / total_steps
-
-    # 總停等時間 = 累積的停等車輛數 * step_length
-    total_waiting_time = sum_halting * STEP_LENGTH
-    
-    # 黃燈比例
-    yellow_ratio = yellow_steps / total_steps
-    
-    # 平均延滯時間
-    if total_arrived_vehicles > 0:
-        avg_delay_time = total_waiting_time / total_arrived_vehicles
-    else:
+        avg_qEB = avg_qWB = avg_qSB = avg_qNB = 0.0
+        avg_hEB = avg_hWB = avg_hSB = avg_hNB = 0.0
+        avg_queue_total = 0.0
+        total_waiting_time = 0.0
         avg_delay_time = 0.0
-        
-    # 平均停等長度
-    avg_queue_total = (sum_qEB + sum_qSB) / total_steps
+        ns_green_ratio = ew_green_ratio = yellow_ratio = 0.0
 
-else:
-    avg_qEB = avg_qSB = 0.0
-    avg_hEB = avg_hSB = 0.0
-    eb_green_ratio = sb_green_ratio = 0.0
-    total_waiting_time = 0.0
-    yellow_ratio = 0.0
-    avg_delay_time = 0.0
-    avg_queue_total = 0.0
+    print("========== LLM Protected-Left Summary ==========")
+    print(f"EB 平均排隊 (Queue) = {avg_qEB:.2f} veh")
+    print(f"WB 平均排隊 (Queue) = {avg_qWB:.2f} veh")
+    print(f"SB 平均排隊 (Queue) = {avg_qSB:.2f} veh")
+    print(f"NB 平均排隊 (Queue) = {avg_qNB:.2f} veh")
+    print(f"Total Avg Queue     = {avg_queue_total:.2f} veh")
+    print("")
+    print(f"EB 平均停等 (Halt)  = {avg_hEB:.2f} veh")
+    print(f"WB 平均停等 (Halt)  = {avg_hWB:.2f} veh")
+    print(f"SB 平均停等 (Halt)  = {avg_hSB:.2f} veh")
+    print(f"NB 平均停等 (Halt)  = {avg_hNB:.2f} veh")
+    print("")
+    print(f"NS 綠燈比例         = {ns_green_ratio:.2f}")
+    print(f"EW 綠燈比例         = {ew_green_ratio:.2f}")
+    print(f"黃燈比例 (Yellow)   = {yellow_ratio:.2f}")
+    print("")
+    print("各時相比例 (Phase Ratios):")
+    for name, cnt in phase_counts.items():
+        ratio = cnt / total_steps
+        print(f"  {name}: {ratio:.2f}")
+    print("")
+    print(f"Total Arrived Veh   = {total_arrived_vehicles}")
+    print(f"Avg Delay Time      = {avg_delay_time:.2f} sec/veh")
+    print(f"Total Waiting Time  = {total_waiting_time:.2f} veh·sec")
+    print(f"Cumulative reward   = {cumulative_reward:.2f}")
+    print("")
+    print("--- LLM Performance ---")
+    print(f"Total API Calls     = {api_call_count}")
+    print(f"Fallback Count      = {fallback_count}")
+    if api_call_count > 0:
+        print(f"Avg API Latency     = {total_api_time/api_call_count:.2f} sec")
+    else:
+        print("Avg API Latency     = 0.00 sec")
+    print("===============================================\n")
 
-print("\n========== LLM-RAP Summary (Objective: Min Waiting Time) ==========")
-print(f"EB 平均排隊 (Queue) = {avg_qEB:.2f} veh")
-print(f"SB 平均排隊 (Queue) = {avg_qSB:.2f} veh")
-print(f"Total Avg Queue     = {avg_queue_total:.2f} veh")
-print(f"EB 平均停等 (Halt)  = {avg_hEB:.2f} veh")
-print(f"SB 平均停等 (Halt)  = {avg_hSB:.2f} veh")
-print("")
-print(f"EB 綠燈比例         = {eb_green_ratio:.2f}")
-print(f"SB 綠燈比例         = {sb_green_ratio:.2f}")
-print(f"黃燈比例 (Yellow)   = {yellow_ratio:.2f}")
-print("")
-print("各時相比例 (Phase Ratios):")
-for p_idx in sorted(phase_counts.keys()):
-    ratio = phase_counts[p_idx] / total_steps
-    print(f"  Phase {p_idx}: {ratio:.2f}")
-print("")
-print(f"Total Arrived Veh   = {total_arrived_vehicles}")
-print(f"Avg Delay Time      = {avg_delay_time:.2f} sec/veh")
-print(f"Total Waiting Time  = {total_waiting_time:.2f} veh·sec")
-print(f"Cumulative reward   = {cumulative_reward:.2f}")
-print("")
-print("--- LLM Performance Metrics ---")
-print(f"Total API Calls     = {api_call_count}")
-print(f"Fallback Count      = {fallback_count} ({fallback_count/api_call_count*100:.1f}%)")
-print(f"Avg API Latency     = {total_api_time/api_call_count:.2f} sec")
-print(f"Total API Time      = {total_api_time:.2f} sec")
-print("========================================================================\n")
+
+if __name__ == "__main__":
+    main()
